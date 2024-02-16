@@ -42,7 +42,7 @@ on:
 
 jobs:
   windows-installer:
-    uses: windows-base.yml
+    uses: windows-base.yml@test-action
     with:
       cura_conan_version: ${{ inputs.cura_conan_version }}
       conan_args: ${{ inputs.conan_args }}
