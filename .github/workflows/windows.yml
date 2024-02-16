@@ -34,20 +34,178 @@ on:
       operating_system:
         description: 'OS'
         required: true
-        default: 'self-hosted-Windows-X64'
+        default: 'windows-2022'
         type: choice
         options:
           - self-hosted-Windows-X64
           - windows-2022
 
+# jobs:
+#   windows-installer:
+#     uses: zhanghongnian/cura-workflows/.github/workflows/cura-installer-windows.yml@main
+#     with:
+#       cura_conan_version: ${{ inputs.cura_conan_version }}
+#       conan_args: ${{ inputs.conan_args }}
+#       enterprise: ${{ inputs.enterprise }}
+#       staging: ${{ inputs.staging }}
+#       architecture: ${{ inputs.architecture }}
+#       operating_system: ${{ inputs.operating_system }}
+#     secrets: inherit
+
+
+env:
+  CONAN_LOGIN_USERNAME: ${{ secrets.CONAN_USER }}
+  CONAN_PASSWORD: ${{ secrets.CONAN_PASS }}
+  WIN_CERT_INSTALLER_CER: ${{ secrets.WIN_CERT_INSTALLER_CER }}
+  WIN_CERT_INSTALLER_CER_PASS: ${{ secrets.WIN_CERT_INSTALLER_CER_PASS }}
+  CURA_CONAN_VERSION: ${{ inputs.cura_conan_version }}
+  ENTERPRISE: ${{ inputs.enterprise }}
+  STAGING: ${{ inputs.staging }}
+  SENTRY_TOKEN: ${{ secrets.CURAENGINE_SENTRY_TOKEN }}
+
 jobs:
-  windows-installer:
-    uses: zhanghongnian/cura-workflows/.github/workflows/cura-installer-windows.yml@main
-    with:
-      cura_conan_version: ${{ inputs.cura_conan_version }}
-      conan_args: ${{ inputs.conan_args }}
-      enterprise: ${{ inputs.enterprise }}
-      staging: ${{ inputs.staging }}
-      architecture: ${{ inputs.architecture }}
-      operating_system: ${{ inputs.operating_system }}
-    secrets: inherit
+  cura-installer-create:
+    runs-on: ${{ inputs.operating_system }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        with:
+          fetch-depth: 1
+          ref: ${{ github.head_ref }}
+
+      - name: Checkout repo PR
+        uses: actions/checkout@v4
+        if: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        with:
+          fetch-depth: 1
+          ref: ${{ github.base_ref }}
+
+      - name: Sync pip requirements
+        run: curl.exe -O https://raw.githubusercontent.com/Ultimaker/cura-workflows/main/.github/workflows/requirements-runner.txt
+        working-directory: .github\workflows
+
+      - name: Setup Python and pip
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11.x
+          cache: pip
+          cache-dependency-path: .\.github\workflows\requirements-runner.txt
+
+      - name: Install Python requirements and Create default Conan profile
+        run: pip install -r .\.github\workflows\requirements-runner.txt
+
+      - name: Create default Conan profile
+        run: conan profile new default --detect --force
+
+      - name: Get Conan configuration
+        run: |
+          conan config install https://github.com/Ultimaker/conan-config.git
+          conan config install https://github.com/Ultimaker/conan-config.git -a "-b runner/${{ runner.os }}/${{ runner.arch }}"
+
+      # - name: Add runner credentials to cura remote
+      #   run: conan user -p ${{ secrets.CONAN_PASS }} -r cura ${{ secrets.CONAN_USER }}
+
+      # - name: Add Cura private Artifactory remote
+      #   if: ${{ inputs.conan_internal }}
+      #   run: |
+      #     conan config install https://github.com/Ultimaker/conan-config.git -a "-b runner/internal"
+      #     conan user -p ${{ secrets.CONAN_PASS }} -r cura-private ${{ secrets.CONAN_USER }}
+
+      - name: Create the Packages (Powershell)
+        run: conan install $Env:CURA_CONAN_VERSION ${{ inputs.conan_args }} --build=missing --update -if cura_inst -g VirtualPythonEnv -o cura:enterprise="$Env:ENTERPRISE" -o cura:staging="$Env:STAGING" -o cura:internal=${{ inputs.conan_internal }} -c tools.build:skip_test=True -s curaengine:build_type=RelWithDebInfo -s arcus:build_type=RelWithDebInfo -s clipper:build_type=RelWithDebInfo
+
+      - name: Set Environment variables for Cura (Powershell)
+        run: |
+          echo "${Env:WIX}\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          .\cura_inst\Scripts\activate_github_actions_env.ps1
+          .\cura_inst\Scripts\activate_github_actions_version_env.ps1
+
+      - name: Create the Cura dist
+        run: pyinstaller ./cura_inst/UltiMaker-Cura.spec
+
+      - name: Get installer helper scripts
+        run: |
+          New-Item -ItemType Directory -Force -Path runner_scripts
+          cd runner_scripts
+          curl.exe -O https://raw.githubusercontent.com/Ultimaker/cura-workflows/main/runner_scripts/cura_installer_filename.py
+          curl.exe -O https://raw.githubusercontent.com/Ultimaker/cura-workflows/main/runner_scripts/summarize_used_dependencies.py
+
+      - name: Output the name file name and extension
+        id: filename
+        run: python runner_scripts/cura_installer_filename.py --os ${{ runner.os }} --arch ${{ inputs.architecture }} --enterprise ${{ inputs.enterprise }} --internal ${{ inputs.conan_internal }}
+
+      - name: Summarize the used dependencies
+        run: python runner_scripts/summarize_used_dependencies.py --installer_filename ${{ steps.filename.outputs.INSTALLER_FILENAME }}
+
+      - name: Create the Windows msi installer (Powershell)
+        run: |
+          python ..\cura_inst\packaging\msi\create_windows_msi.py ..\cura_inst .\UltiMaker-Cura "${{steps.filename.outputs.INSTALLER_FILENAME }}.msi" "$Env:CURA_APP_NAME"
+        working-directory: dist
+
+      - name: Sign the Windows msi installer (Powershell)
+        run: |
+          & signtool sign /v /fd sha256 /tr http://timestamp.digicert.com /td sha256 /f C:\actions-runner\code_sign.cer /csp "eToken Base Cryptographic Provider" /kc ${{ secrets.WIN_TOKEN_CONTAINER }} "${{steps.filename.outputs.INSTALLER_FILENAME }}.msi"
+        working-directory: dist
+        timeout-minutes: 2
+
+      - name: Create the Windows exe installer (Powershell)
+        if: ${{ always() }}
+        run: |
+          python ..\cura_inst\packaging\NSIS\create_windows_installer.py ../cura_inst . "${{steps.filename.outputs.INSTALLER_FILENAME }}.exe"
+        working-directory: dist
+
+      - name: Sign the Windows exe installer (Powershell)
+        if: ${{ always() }}
+        run: |
+          & signtool sign /v /fd sha256 /tr http://timestamp.digicert.com /td sha256 /f C:\actions-runner\code_sign.cer /csp "eToken Base Cryptographic Provider" /kc ${{ secrets.WIN_TOKEN_CONTAINER }} "${{steps.filename.outputs.INSTALLER_FILENAME }}.exe"
+        working-directory: dist
+        timeout-minutes: 2
+
+      - name: Remove internal packages before uploading
+        if: ${{ always() }}
+        run: |
+          conan remove "*@internal/*" -f
+          conan remove "cura_private_data*" -f
+
+      - name: Upload the Package(s)
+        if: ${{ always() && ! inputs.conan_internal }}
+        run: conan upload "*" -r cura --all -c
+
+      - name: Upload the msi
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{steps.filename.outputs.INSTALLER_FILENAME }}-msi
+          path: |
+            dist/${{steps.filename.outputs.INSTALLER_FILENAME }}.msi
+          retention-days: 5
+
+      - name: Upload the exe
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{steps.filename.outputs.INSTALLER_FILENAME }}-exe
+          path: |
+            dist/${{steps.filename.outputs.INSTALLER_FILENAME }}.exe
+          retention-days: 5
+
+      # NOTE: The extension is .sh, since this isn't going to build-environment, so not on the Win build image.
+      - name: Write the run info
+        if: ${{ always() }}
+        shell: python
+        run: |
+          import os
+          with open("run_info.sh", "w") as f:
+              f.writelines(f'echo "CURA_VERSION_FULL={os.environ["CURA_VERSION_FULL"]}" >> $GITHUB_ENV\n')
+
+      # NOTE: The extension is .sh, since this isn't going to build-environment, so not on the Win build image.
+      - name: Upload the run info
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: windows-run-info
+          path: |
+            run_info.sh
+          retention-days: 5
