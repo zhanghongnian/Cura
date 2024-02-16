@@ -39,6 +39,10 @@ on:
         options:
           - self-hosted-Windows-X64
           - windows-2022
+      conan_internal:
+        required: false
+        default: false
+        type: boolean
 
 # jobs:
 #   windows-installer:
